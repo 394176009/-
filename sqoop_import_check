@@ -1,0 +1,269 @@
+#!/bin/sh
+#***********************************************************
+#useage      每日检查sqoop import数据的完整性
+#parameter   $1: 数据日期，格式YYYY-MM-DD ,
+#            $2：来源系统,xdq:信贷圈,yjr:云金融,vip:VIP门店
+#***********************************************************
+#保存结果到hive表中
+save()
+{
+mysqlcont=$1
+hivecont=$2
+time=$3
+source=$4
+database=$5
+hivedatabase=$6
+
+#滤掉mysql字符串里的空格
+mysqlcont=`echo $mysqlcont | sed s/[[:space:]]//g`
+#滤掉字符串中第一个分割符
+hivecont=`echo ${hivecont} | cut -c 2-${#hivecont}`
+
+#将采集结果保存到临时文件中
+mysqlnum=`echo ${mysqlcont} | awk -F'|' '{print NF}'`
+hivenum=`echo ${hivecont} | awk -F'|' '{print NF}'`
+delimiter=","
+if [ ${mysqlnum} -ne ${hivenum} ]; then
+   exit -2 
+fi
+if [ -f `pwd`/sqoop_check_tmp.txt ];then
+        rm `pwd`/sqoop_check_tmp.txt
+fi
+for i in `seq ${mysqlnum}`
+   do
+     mysqlrec=`echo ${mysqlcont} | awk -F'|' '{print $i}' i="$i"`
+     hiverec=`echo ${hivecont} | awk -F'|' '{print $i}' i="$i"`
+     record=${time}${delimiter}${source}${delimiter}${database}${delimiter}${mysqlrec}${delimiter}${hivedatabase}${delimiter}${hiverec}${delimiter}`date +"%Y-%m-%d %H:%M:%S"`
+     echo $record >> `pwd`/sqoop_check_tmp.txt
+   done
+
+#将文件内容load到hive表中
+sed -i s/,//g sqoop_check_tmp.txt
+hive -S -e "LOAD DATA LOCAL INPATH 'sqoop_check_tmp.txt' INTO TABLE rawlog.sqoop_import_log"
+}
+#采集信贷圈数据的mysql和hive数据量
+gather_xdq()
+{
+time=$1
+#mysql info
+host=192.168.10.64
+username=sunbo
+password=2aV0rXZ5KetD
+port=3307
+database=interface_hd_com
+#hive info
+hivedatabase="credit_new.db"
+hivetab_list="b_back_order c_intent_user2015 b_orders b_member_card payment b_users b_users_info zone b_xdy_card b_xdy_card_pre b_card_info account b_coin b_coupon_record c_intent_user_institution"
+mysqltext="                                                                                          
+select 'b_back_order',',',count(*),'|' from b_back_order where to_days(FROM_UNIXTIME(back_time))=to_days('$time') \
+union all \
+select 'c_intent_user2015',',',count(*),'|' from c_intent_user2015 where to_days(FROM_UNIXTIME(c_time))=to_days('$time') \
+union all \
+select 'b_orders',',',count(*),'|' from b_orders where to_days(FROM_UNIXTIME(c_time))=to_days('$time') \
+union all \
+select 'b_member_card',',',count(*),'|' from b_member_card where to_days(FROM_UNIXTIME(ctime))=to_days('$time') \
+union all \
+select 'payment',',',count(*),'|' from payment where to_days(c_time)=to_days('$time') \
+union all \
+select 'b_users',',',count(*),'|' from b_users where to_days(FROM_UNIXTIME(c_time))=to_days('$time') \
+union all \
+select 'b_users_info',',',count(*),'|' from b_users_info where to_days(utime)<=to_days('$time') \
+union all \
+select 'zone',',',count(*),'|' from zone where 1=1 \
+union all \
+select 'b_xdy_card',',',count(*),'|' from b_xdy_card where to_days(FROM_UNIXTIME(add_time))=to_days('$time') \
+union all \
+select 'b_xdy_card_pre',',',count(*),'|' from b_xdy_card_pre where to_days(FROM_UNIXTIME(add_time))=to_days('$time') \
+union all \
+select 'b_card_info',',',count(*),'|' from b_card_info where to_days(FROM_UNIXTIME(add_time))<=to_days('$time') \
+union all \
+select 'account',',',count(*),'|' from account where to_days(FROM_UNIXTIME(c_time))=to_days('$time') \
+union all \
+select 'b_coin',',',count(*),'|' from b_coin where to_days(ctime)=to_days('$time') \
+union all \
+select 'b_coupon_record',',',count(*),'|' from b_coupon_record where to_days(c_time)=to_days('$time') \
+union all \
+select 'c_intent_user_institution',',',count(*),'' from c_intent_user_institution where 1=1 \
+"
+
+#采集mysql中的数据量
+mysqlcont=`mysql -h${host} -u${username} -p${password} -P${port} -D${database} -s -e "${mysqltext}"`
+
+#采集hive表中的数据量
+hivecont=""
+for tab in ${hivetab_list}
+        do
+        #判断目录下是分区目录还是文件
+          filetype=`hadoop fs -ls /user/hive/warehouse/${hivedatabase}/${tab}/ | tail -1 | cut -c 1`
+          if [ ${filetype} = "-" ]; then
+                  hivecount=`hadoop fs -cat /user/hive/warehouse/${hivedatabase}/${tab}/* | wc -l`
+          else
+            hivecount=`hadoop fs -cat /user/hive/warehouse/${hivedatabase}/${tab}/pdate=${time}/* | wc -l`
+          fi
+          tabcount=${tab}","${hivecount}
+          hivecont=${hivecont}"|"${tabcount}
+done
+
+#调用保存函数
+save "${mysqlcont}" "${hivecont}" ${time} xdq ${database} ${hivedatabase}
+}
+
+#采集云金融数据的mysql和hive数据量
+gather_yjr()
+{
+time=$1
+#mysql info
+host=192.168.10.253
+username=sunbo
+password=QAhZVIkGJmW3wSBS
+port=3307
+database=liuliang
+#hive info
+hivedatabase="raw_yjr_temp.db"
+hivetab_list="s_order_base s_user_info c_intent_user"
+mysqltext="
+select 's_order_base',',',count(*),'|' from s_order_base where to_days(from_unixtime(created_at))<=to_days('$time') or to_days(from_unixtime(updated_at))<=to_days('$time') \
+union all \
+select 's_user_info',',',count(*),'|' from s_user_info where to_days(from_unixtime(c_time))<=to_days('$time') or to_days(from_unixtime(u_time))<=to_days('$time') \
+union all \
+select 'c_intent_user',',',count(*),'' from c_intent_user where (to_days(from_unixtime(c_time))<=to_days('$time') or to_days(u_time)<=to_days('$time')) \
+"
+
+#采集mysql中的数据量
+mysqlcont=`mysql -h${host} -u${username} -p${password} -P${port} -D${database} -s -e "${mysqltext}"`
+#采集hive表中的数据量
+hivecont=""
+for tab in ${hivetab_list}
+        do
+        #判断目录下是分区目录还是文件
+          filetype=`hadoop fs -ls /user/hive/warehouse/${hivedatabase}/${tab}/ | tail -1 | cut -c 1`
+          if [ ${filetype} = "-" ]; then
+                  hivecount=`hadoop fs -cat /user/hive/warehouse/${hivedatabase}/${tab}/* | wc -l`
+          else
+            hivecount=`hadoop fs -cat /user/hive/warehouse/${hivedatabase}/${tab}/pdate=${time}/* | wc -l`
+          fi
+          tabcount=${tab}","${hivecount}
+          hivecont=${hivecont}"|"${tabcount}
+done
+
+#调用保存函数
+save "${mysqlcont}" "${hivecont}" ${time} yjr ${database} ${hivedatabase}
+}
+
+#采集VIP门店数据的mysql和hive数据量
+gather_vip()
+{
+time=$1
+#mysql info
+host=192.168.10.253
+username=sunbo
+password=nAc41aJIV8K5M5xi
+port=3306
+database=vip
+#hive info
+hivedatabase="raw_vip_temp.db"
+hivetab_list="loan_demand store_customer store_customer_tag pre_order preorder_change_record deposit commission retainage order business_fee_record store_account order_operate_log pending_order deposit_remark commission_remark retainage_remark store store_customer_tag_record"
+mysqltext="
+select 'loan_demand',',',count(*),'|' from loan_demand where to_days(from_unixtime(create_time))<=to_days('$time') or to_days(from_unixtime(update_time))<=to_days('$time') \
+union all \
+select 'store_customer',',',count(*),'|' from store_customer where to_days(from_unixtime(gen_time))<=to_days('$time') or to_days(from_unixtime(update_time))<=to_days('$time') \
+union all \
+select 'store_customer_tag',',',count(*),'|' from store_customer_tag \
+union all \
+select 'pre_order',',',count(*),'|' from pre_order where to_days(from_unixtime(create_time))<=to_days('$time') or to_days(from_unixtime(update_time))<=to_days('$time') \
+union all \
+select 'preorder_change_record',',',count(*),'|' from preorder_change_record where to_days(from_unixtime(create_time))<=to_days('$time') \
+union all \
+select 'deposit',',',count(*),'|' from deposit where to_days(from_unixtime(create_time))<=to_days('$time') or to_days(from_unixtime(update_time))<=to_days('$time') \
+union all \
+select 'commission',',',count(*),'|' from commission where to_days(from_unixtime(create_time))<=to_days('$time') or to_days(from_unixtime(update_time))<=to_days('$time') \
+union all \
+select 'retainage',',',count(*),'|' from retainage where to_days(from_unixtime(create_time))<=to_days('$time') or to_days(from_unixtime(update_time))<=to_days('$time') \
+union all \
+select 'order',',',count(*),'|' from `order` where to_days(from_unixtime(create_time))<=to_days('$time') or to_days(from_unixtime(update_time))<=to_days('$time') \
+union all \
+select 'business_fee_record',',',count(*),'|' from business_fee_record where to_days(from_unixtime(create_time))<=to_days('$time') or to_days(from_unixtime(update_time))<=to_days('$time') \
+union all \
+select 'store_account',',',count(*),'|' from store_account where to_days(from_unixtime(create_time))<=to_days('$time') or to_days(from_unixtime(update_time))<=to_days('$time') \
+union all \
+select 'order_operate_log',',',count(*),'|' from order_operate_log where to_days(from_unixtime(create_time))<=to_days('$time') \
+union all \
+select 'pending_order',',',count(*),'|' from pending_order where to_days(from_unixtime(create_time))<=to_days('$time') or to_days(from_unixtime(update_time))<=to_days('$time') \
+union all \
+select 'deposit_remark',',',count(*),'|' from deposit_remark where to_days(from_unixtime(create_time))<=to_days('$time') \
+union all \
+select 'commission_remark',',',count(*),'|' from commission_remark where to_days(from_unixtime(create_time))<=to_days('$time') \
+union all \
+select 'retainage_remark',',',count(*),'|' from retainage_remark where to_days(from_unixtime(create_time))<=to_days('$time') \
+union all \
+select 'store',',',count(*),'|' from store where to_days(from_unixtime(create_time))<=to_days('$time') or to_days(from_unixtime(update_time))<=to_days('$time') \
+union all \
+select 'store_customer_tag_record',',',count(*),'' from store_customer_tag_record where to_days(from_unixtime(create_time))<=to_days('$time') \
+"
+
+#采集mysql中的数据量
+mysqlcont=`mysql -h${host} -u${username} -p${password} -P${port} -D${database} -s -e "${mysqltext}"`
+
+#采集hive表中的数据量
+hivecont=""
+for tab in ${hivetab_list}
+        do
+        #判断目录下是分区目录还是文件
+          filetype=`hadoop fs -ls /user/hive/warehouse/${hivedatabase}/${tab}/ | tail -1 | cut -c 1`
+          if [ ${filetype} = "-" ]; then
+                  hivecount=`hadoop fs -cat /user/hive/warehouse/${hivedatabase}/${tab}/* | wc -l`
+          else
+            hivecount=`hadoop fs -cat /user/hive/warehouse/${hivedatabase}/${tab}/pdate=${time}/* | wc -l`
+          fi
+          tabcount=${tab}","${hivecount}
+          hivecont=${hivecont}"|"${tabcount}
+done
+
+#调用保存函数
+save "${mysqlcont}" "${hivecont}" ${time} vip ${database} ${hivedatabase}
+}
+#查询hive导数日志表，监控报警
+check_result()
+{
+dt=$1
+source=$2
+
+result=`hive -S -e "select count(*) from rawlog.sqoop_import_log where dt='$dt' and source='$source' and src_count<>target_count"`
+result=`echo $result | cut -d" " -f 1`
+if [ ${result} -ne 0 ]; then
+   echo "Sqoop导入数据监控发现异常.来源系统:"$source",数据日期:"$dt >> sqoop_import_monitor.log
+else
+   echo "Sqoop导入数据监控正常.来源系统:"$source",数据日期:"$dt >> sqoop_import_monitor.log
+fi
+}
+
+main()
+{
+#判断传入参数格式是否正确
+if [ $# -ne 2 ]; then
+   echo "参数个数不正确，请检查 "
+   exit -1
+fi
+#检查参数2的值是否在范围内
+if [ $2 != "xdq" -a  $2 != "yjr" -a $2 != "vip" ]; then
+   echo "参数2请输入xdq,yjr,vip之一"
+   exit -1
+fi
+dt=$1
+source=$2
+
+#调用数据条目采集函数,向hive采集日志表中插入源表与目标表的条数
+case $source in
+        "xdq") gather_xdq ${dt}
+               check_result ${dt} ${source}
+        ;;
+        "yjr") gather_yjr ${dt}
+               check_result ${dt} ${source}
+        ;;
+        "vip") gather_vip ${dt}
+               check_result ${dt} ${source}
+        ;;
+esac
+}
+
+main $1 $2
